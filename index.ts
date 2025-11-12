@@ -3,7 +3,7 @@
 import { WebSocket } from "ws";
 import { fetch } from "undici";
 import chalk from "chalk";
-import { appendFileSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
 
 function getCurrent15mMarketUrl() {
@@ -29,6 +29,74 @@ const FRONTEND_URL = getCurrent15mMarketUrl();
 
 const DEBUG_LOG_FILE = join(process.cwd(), "btc_price_debug.log");
 const SIM_LOG_FILE = join(process.cwd(), "sim_trades.log");
+const chainlinkCache = new Map<string, { price: number; ts: number }>();
+const startingPriceCache = new Map<string, { price: number | null; source: string; ts: number }>();
+let lastBtcPrice: number | null = null;
+let lastBtcPriceTs = 0;
+let btcPriceRequest: Promise<number | null> | null = null;
+
+class AsyncLogWriter {
+  private buffer: string[] = [];
+  private flushing = false;
+  private timer?: NodeJS.Timeout;
+
+  constructor(
+    private readonly file: string,
+    private readonly flushIntervalMs = 250,
+    private readonly maxBatchBytes = 16_384,
+  ) {}
+
+  write(chunk: string) {
+    this.buffer.push(chunk);
+    const bufferedBytes = this.buffer.reduce((total, part) => total + Buffer.byteLength(part), 0);
+    if (bufferedBytes >= this.maxBatchBytes) {
+      void this.flush();
+      return;
+    }
+    if (!this.timer) {
+      const timeout = setTimeout(() => {
+        this.timer = undefined;
+        void this.flush();
+      }, this.flushIntervalMs);
+      timeout.unref?.();
+      this.timer = timeout;
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (this.flushing || this.buffer.length === 0) {
+      return;
+    }
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    const payload = this.buffer.join("");
+    this.buffer = [];
+    this.flushing = true;
+    try {
+      await appendFile(this.file, payload);
+    } catch (err) {
+      console.error(`Failed to append ${this.file}:`, err);
+    } finally {
+      this.flushing = false;
+      if (this.buffer.length) {
+        void this.flush();
+      }
+    }
+  }
+}
+
+const debugLogWriter = new AsyncLogWriter(DEBUG_LOG_FILE);
+const simLogWriter = new AsyncLogWriter(SIM_LOG_FILE);
+
+async function flushLogWriters() {
+  await Promise.allSettled([debugLogWriter.flush(), simLogWriter.flush()]);
+}
+
+process.on("beforeExit", () => {
+  void flushLogWriters();
+});
 
 // WS endpoint: base path (no trailing /market)
 const WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -42,6 +110,9 @@ const EXPIRY_CHECK_MS = 5_000;
 const RECONNECT_BASE_MS = 1_000;        // backoff base
 const RECONNECT_MAX_MS = 15_000;        // backoff cap
 const BTC_HISTORY_MAX = 2000;           // 2000 samples @ 100ms = 200 seconds of history
+const CHAINLINK_CACHE_TTL_MS = 60_000;
+const STARTING_PRICE_CACHE_TTL_MS = 60_000;
+const BTC_PRICE_CACHE_TTL_MS = 750;
 
 // ----------------- logging helper -----------------
 function logApiResponse(endpoint: string, response: any, context = "") {
@@ -53,11 +124,7 @@ function logApiResponse(endpoint: string, response: any, context = "") {
     body = String(response);
   }
   const logLine = `${timestamp} [${context}] ${endpoint}\n${body}\n${"-".repeat(80)}\n`;
-  try {
-    appendFileSync(DEBUG_LOG_FILE, logLine);
-  } catch (e) {
-    console.error("Failed to write debug log:", e);
-  }
+  debugLogWriter.write(logLine);
 }
 
 // Dedicated simulator logger (JSON Lines)
@@ -71,7 +138,7 @@ function logSim(event: any) {
       null,
       2
     );
-    appendFileSync(SIM_LOG_FILE, line + "\n");
+    simLogWriter.write(line + "\n");
   } catch {}
 }
 
@@ -106,7 +173,102 @@ function normalizeAssetIds(raw: unknown): string[] {
   return uniq;
 }
 
-async function tryGammaForTokenIds(slug: string): Promise<{ assetIds: string[]; marketId?: string; marketObj?: any; tokenOutcomes?: Record<string, string> }> {
+async function fetchJsonWithTimeout(url: string, timeoutMs = 3_000): Promise<any | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeOutcomeLabel(raw: unknown): "Up" | "Down" | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (/\b(up|yes|over|above|greater|>=|higher)\b/.test(normalized)) return "Up";
+  if (/\b(down|no|under|below|less|<=|lower)\b/.test(normalized)) return "Down";
+  return undefined;
+}
+
+function extractTokenOutcome(token: any): "Up" | "Down" | undefined {
+  if (!token || typeof token !== "object") return undefined;
+  if (typeof token.is_yes === "boolean") return token.is_yes ? "Up" : "Down";
+  if (typeof token.is_up === "boolean") return token.is_up ? "Up" : "Down";
+  const fields = [
+    token.outcome,
+    token.outcomeName,
+    token.outcome_name,
+    token.outcomeLabel,
+    token.name,
+    token.ticker,
+    token.symbol,
+    token.side,
+    token.title,
+  ];
+  for (const field of fields) {
+    const normalized = normalizeOutcomeLabel(field);
+    if (normalized) return normalized;
+  }
+  if (typeof token.side === "string") {
+    const normalized = normalizeOutcomeLabel(token.side);
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
+
+function collectTokenOutcomes(
+  source: any,
+  target: Record<string, "Up" | "Down">,
+) {
+  if (!source) return;
+  const entries = Array.isArray(source) ? source : [source];
+  for (const entry of entries) {
+    if (!entry) continue;
+    if (Array.isArray(entry.tokens)) {
+      collectTokenOutcomes(entry.tokens, target);
+      continue;
+    }
+    const ids = normalizeAssetIds(
+      entry?.clobTokenId ??
+      entry?.clob_token_id ??
+      entry?.token_id ??
+      entry?.tokenId ??
+      entry?.id ??
+      entry
+    );
+    if (!ids.length) continue;
+    const outcome = extractTokenOutcome(entry);
+    if (outcome) {
+      for (const id of ids) {
+        target[id] = outcome;
+      }
+    }
+  }
+}
+
+function parseOutcomeStrings(raw: any): string[] {
+  if (Array.isArray(raw)) {
+    return raw.filter((v) => typeof v === "string").map((v) => v as string);
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((v) => typeof v === "string").map((v) => v as string);
+      }
+    } catch {}
+    return raw.split(/[,;\n]/).map((part) => part.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+async function tryGammaForTokenIds(slug: string): Promise<{ assetIds: string[]; marketId?: string; marketObj?: any; tokenOutcomes?: Record<string, "Up" | "Down"> }> {
   // 1) market-by-slug
   try {
     const endpoint = `https://gamma-api.polymarket.com/markets/slug/${slug}`;
@@ -117,32 +279,47 @@ async function tryGammaForTokenIds(slug: string): Promise<{ assetIds: string[]; 
       const raw = mk?.clobTokenIds ?? mk?.clob_token_ids ?? mk?.tokens?.map((t: any) => t?.token_id ?? t?.tokenId ?? t?.id) ?? mk;
       const ids = normalizeAssetIds(raw);
       if (ids.length >= 2) {
-        // Map token IDs to outcomes (Up/Down)
-        const tokenOutcomes: Record<string, string> = {};
-        try {
-          const outcomes = JSON.parse(mk?.outcomes ?? '[]');
-          const outcomePrices = JSON.parse(mk?.outcomePrices ?? '[]');
-          
-          // LOG MAPPING FOR DEBUGGING
-          console.log("\n" + chalk.bgYellow.black(" TOKEN MAPPING DEBUG "));
-          console.log(chalk.bold("Token IDs (clobTokenIds order):"));
-          ids.forEach((id, i) => console.log(chalk.cyan(`  [${i}] ${id.slice(0,12)}...${id.slice(-12)}`)));
-          console.log(chalk.bold("\nOutcomes array:"));
-          outcomes.forEach((o: string, i: number) => console.log(chalk.green(`  [${i}] ${o}`)));
-          console.log(chalk.bold("\nOutcome Prices:"));
-          outcomePrices.forEach((p: string, i: number) => console.log(chalk.yellow(`  [${i}] ${p}`)));
-          
-          console.log(chalk.bold("\nCURRENT MAPPING (by index):"));
-if (Array.isArray(outcomes) && ids.length === outcomes.length) {
-  ids.forEach((id, i) => { 
-    // FIX: Reverse the order - token[0] maps to outcome[1] (Down), token[1] maps to outcome[0] (Up)
-    const reverseIdx = outcomes.length - 1 - i;
-    tokenOutcomes[id] = outcomes[reverseIdx];
-    console.log(chalk.magenta(`  Token[${i}] → ${outcomes[reverseIdx]} @ ${outcomePrices[reverseIdx]}`));
-  });
-}
-          console.log(chalk.dim("→ Watch live orderbook prices to verify!\n"));
-        } catch {}
+        const tokenOutcomes: Record<string, "Up" | "Down"> = {};
+        collectTokenOutcomes(mk, tokenOutcomes);
+        collectTokenOutcomes(mk?.condition, tokenOutcomes);
+        collectTokenOutcomes(mk?.markets, tokenOutcomes);
+        if (Array.isArray(mk?.markets)) {
+          for (const market of mk.markets) {
+            collectTokenOutcomes(market?.condition, tokenOutcomes);
+          }
+        }
+
+        if (Object.keys(tokenOutcomes).length < ids.length) {
+          const outcomesList = parseOutcomeStrings(mk?.outcomes ?? mk?.outcomeLabels ?? mk?.outcome_labels);
+          if (outcomesList.length === ids.length) {
+            outcomesList.forEach((label, index) => {
+              const outcome = normalizeOutcomeLabel(label);
+              if (outcome) tokenOutcomes[ids[index]] = outcome;
+            });
+          }
+        }
+
+        if (Object.keys(tokenOutcomes).length < ids.length && Array.isArray(mk?.tokens)) {
+          mk.tokens.forEach((token: any, index: number) => {
+            const outcome = extractTokenOutcome(token);
+            const idCandidates = normalizeAssetIds(
+              token?.clobTokenId ?? token?.clob_token_id ?? token?.token_id ?? token?.tokenId ?? token?.id
+            );
+            const targetId = idCandidates[0] ?? ids[index];
+            if (targetId && outcome) tokenOutcomes[targetId] = outcome;
+          });
+        }
+
+        if (Object.keys(tokenOutcomes).length === 0) {
+          console.warn(chalk.yellow("Warning: Unable to confidently map token IDs to outcomes."));
+        } else {
+          console.log("\n" + chalk.bgYellow.black(" TOKEN MAPPING " ));
+          ids.forEach((id, idx) => {
+            const outcome = tokenOutcomes[id] ?? "?";
+            console.log(chalk.cyan(`  [${idx}] ${id.slice(0, 12)}...${id.slice(-12)} → ${outcome}`));
+          });
+        }
+
         return { assetIds: ids, marketId: mk?.id, marketObj: mk, tokenOutcomes };
       }
     }
@@ -192,17 +369,27 @@ if (Array.isArray(outcomes) && ids.length === outcomes.length) {
 }
 
 // ----------------- BTC price fetching -----------------
-async function fetchChainlinkPrice(conditionId?: string, slug?: string, eventStartTime?: string, endDate?: string): Promise<number | null> {
+async function fetchChainlinkPrice(
+  conditionId?: string,
+  slug?: string,
+  eventStartTime?: string,
+  endDate?: string,
+): Promise<number | null> {
+  const cacheKey = [conditionId ?? "", slug ?? "", eventStartTime ?? "", endDate ?? ""].join("|");
+  const cached = chainlinkCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.ts < CHAINLINK_CACHE_TTL_MS) {
+    return cached.price;
+  }
+
   const endpoints: string[] = [];
 
-  // Polymarket frontend special endpoint (if available)
   if (eventStartTime && endDate) {
     endpoints.push(
       `https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=${encodeURIComponent(eventStartTime)}&variant=fifteen&endDate=${encodeURIComponent(endDate)}`
     );
   }
 
-  // Polymarket data/crypto endpoints (commonly public)
   endpoints.push(
     "https://data-api.polymarket.com/prices/btc",
     "https://clob.polymarket.com/prices/btc",
@@ -225,103 +412,139 @@ async function fetchChainlinkPrice(conditionId?: string, slug?: string, eventSta
     );
   }
 
-  // Public crypto price fallbacks
   endpoints.push(
     "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
     "https://api.coinbase.com/v2/prices/BTC-USD/spot",
     "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
   );
 
-  for (const endpoint of endpoints) {
-    try {
-      const r = await fetch(endpoint);
-      if (!r.ok) continue;
-      const data = await r.json();
-      logApiResponse(endpoint, data, "BTC_REFERENCE_PRICE_ENDPOINT");
+  const uniqueEndpoints = [...new Set(endpoints)];
 
-      let price: unknown =
-        (data as any)?.openPrice ??
-        (data as any)?.startPrice ?? (data as any)?.start_price ??
-        (data as any)?.priceAtStart ?? (data as any)?.initialPrice ??
-        (data as any)?.price ?? (data as any)?.btc ?? (data as any)?.value ??
-        (data as any)?.answer ?? (data as any)?.current ?? (data as any)?.referencePrice ??
-        (data as any)?.ancillaryData;
+  const requests = uniqueEndpoints.map(async (endpoint) => {
+    const data = await fetchJsonWithTimeout(endpoint, 4_000);
+    if (!data) return null;
+    logApiResponse(endpoint, data, "BTC_REFERENCE_PRICE_ENDPOINT");
 
-      if ((data as any)?.bitcoin?.usd) price = (data as any).bitcoin.usd;               // CoinGecko
-      if ((data as any)?.data?.amount) price = Number((data as any).data.amount);       // Coinbase
-      if ((data as any)?.price && typeof (data as any).price === "string") {            // Binance
-        price = Number((data as any).price);
-      }
+    let price: unknown =
+      (data as any)?.openPrice ??
+      (data as any)?.startPrice ?? (data as any)?.start_price ??
+      (data as any)?.priceAtStart ?? (data as any)?.initialPrice ??
+      (data as any)?.price ?? (data as any)?.btc ?? (data as any)?.value ??
+      (data as any)?.answer ?? (data as any)?.current ?? (data as any)?.referencePrice ??
+      (data as any)?.ancillaryData;
 
-      if (typeof price === "number" && Number.isFinite(price)) return price;
-      const parsed = Number(price);
-      if (!Number.isNaN(parsed) && Number.isFinite(parsed)) return parsed;
-    } catch {}
+    if ((data as any)?.bitcoin?.usd) price = (data as any).bitcoin.usd;
+    if ((data as any)?.data?.amount) price = Number((data as any).data.amount);
+    if ((data as any)?.price && typeof (data as any).price === "string") {
+      price = Number((data as any).price);
+    }
+
+    const numeric = typeof price === "number" ? price : Number(price);
+    return Number.isFinite(numeric) ? numeric : null;
+  });
+
+  const responses = await Promise.allSettled(requests);
+  for (const response of responses) {
+    if (response.status === "fulfilled" && typeof response.value === "number" && Number.isFinite(response.value)) {
+      chainlinkCache.set(cacheKey, { price: response.value, ts: Date.now() });
+      return response.value;
+    }
   }
-  return null;
+
+  return cached?.price ?? null;
 }
 
 // ----------------- starting price discovery -----------------
-async function fetchStartingPrice(marketObj: any, marketId: string | undefined, assetIds: string[]): Promise<{ price: number | null; source: string }> {
-  // 1) explicit fields on Gamma market (exclude created_at!)
-  try {
-    if (marketObj) {
-      const candidates: Array<{ v: any; src: string }> = [];
-      for (const key of ["opening_price", "starting_price", "openingPrice", "start_price", "initial_price", "initialMarkPrice", "initial_mark_price"]) {
-        if (marketObj[key] != null) candidates.push({ v: marketObj[key], src: `gamma.market.${key}` });
-      }
-      for (const c of candidates) {
-        const n = Number(c.v);
-        if (!Number.isNaN(n) && isFinite(n) && n > 0) return { price: n, source: c.src };
+async function fetchStartingPrice(
+  marketObj: any,
+  marketId: string | undefined,
+  assetIds: string[],
+): Promise<{ price: number | null; source: string }> {
+  const cacheKey = marketId ?? marketObj?.slug ?? assetIds.join(",");
+  const cached = cacheKey ? startingPriceCache.get(cacheKey) : undefined;
+  if (cached && Date.now() - cached.ts < STARTING_PRICE_CACHE_TTL_MS) {
+    return { price: cached.price, source: cached.source };
+  }
+
+  const remember = (price: number | null, source: string) => {
+    if (cacheKey) {
+      startingPriceCache.set(cacheKey, { price, source, ts: Date.now() });
+    }
+    return { price, source };
+  };
+
+  if (marketObj) {
+    for (const key of [
+      "opening_price",
+      "starting_price",
+      "openingPrice",
+      "start_price",
+      "initial_price",
+      "initialMarkPrice",
+      "initial_mark_price",
+    ]) {
+      const value = marketObj[key];
+      const numeric = Number(value);
+      if (!Number.isNaN(numeric) && Number.isFinite(numeric) && numeric > 0) {
+        return remember(numeric, `gamma.market.${key}`);
       }
     }
-  } catch {}
+  }
 
-  // 2) earliest trade
-  try {
-    if (marketId) {
-      const endpoint = `https://clob.polymarket.com/markets/${marketId}/trades?limit=1&sort=asc`;
-      const r = await fetch(endpoint);
-      if (r.ok) {
-        const data = await r.json();
+  const tradeRequests: Array<Promise<{ price: number; source: string } | null>> = [];
+
+  if (marketId) {
+    const endpoint = `https://clob.polymarket.com/markets/${marketId}/trades?limit=1&sort=asc`;
+    tradeRequests.push(
+      (async () => {
+        const data = await fetchJsonWithTimeout(endpoint, 4_000);
+        if (!data) return null;
         logApiResponse(endpoint, data, "EARLIEST_TRADE_BY_MARKET");
         const arr = data?.data ?? data;
-        if (Array.isArray(arr) && arr.length) {
-          const p = Number(arr[0]?.price ?? arr[0]?.px ?? arr[0]?.price_decimal ?? arr[0]?.priceUsd);
-          if (!Number.isNaN(p) && isFinite(p)) return { price: p, source: "clob.markets.{id}.trades.earliest" };
-        }
-      }
-    }
-    for (const aid of assetIds) {
-      const endpoint2 = `https://clob.polymarket.com/trades?asset_id=${encodeURIComponent(aid)}&limit=1&sort=asc`;
-      const r2 = await fetch(endpoint2);
-      if (r2.ok) {
-        const data = await r2.json();
-        logApiResponse(endpoint2, data, `EARLIEST_TRADE_BY_ASSET ${aid}`);
+        if (!Array.isArray(arr) || !arr.length) return null;
+        const value = Number(arr[0]?.price ?? arr[0]?.px ?? arr[0]?.price_decimal ?? arr[0]?.priceUsd);
+        return Number.isFinite(value) ? { price: value, source: "clob.market.trades.earliest" } : null;
+      })(),
+    );
+  }
+
+  for (const aid of assetIds) {
+    const endpoint = `https://clob.polymarket.com/trades?asset_id=${encodeURIComponent(aid)}&limit=1&sort=asc`;
+    tradeRequests.push(
+      (async () => {
+        const data = await fetchJsonWithTimeout(endpoint, 4_000);
+        if (!data) return null;
+        logApiResponse(endpoint, data, `EARLIEST_TRADE_BY_ASSET ${aid}`);
         const arr = data?.data ?? data;
-        if (Array.isArray(arr) && arr.length) {
-          const p = Number(arr[0]?.price ?? arr[0]?.px ?? arr[0]?.price_decimal);
-          if (!Number.isNaN(p) && isFinite(p)) return { price: p, source: `clob.trades.asset:${aid}.earliest` };
-        }
+        if (!Array.isArray(arr) || !arr.length) return null;
+        const value = Number(arr[0]?.price ?? arr[0]?.px ?? arr[0]?.price_decimal ?? arr[0]?.priceUsd);
+        return Number.isFinite(value) ? { price: value, source: `clob.asset.${aid}.earliest` } : null;
+      })(),
+    );
+  }
+
+  if (tradeRequests.length) {
+    const trades = await Promise.allSettled(tradeRequests);
+    for (const trade of trades) {
+      if (trade.status === "fulfilled" && trade.value) {
+        return remember(trade.value.price, trade.value.source);
       }
     }
-  } catch {}
+  }
 
-  // 3) fallback to mid via slug (current snapshot)
-  try {
-    if (marketObj?.slug) {
-      const endpoint3 = `https://gamma-api.polymarket.com/markets/slug/${marketObj.slug}`;
-      const r3 = await fetch(endpoint3);
-      if (r3.ok) {
-        const mk2 = await r3.json();
-        logApiResponse(endpoint3, mk2, "MARKET_MID_PRICE_FALLBACK");
-        const mid = Number(mk2?.mid_price ?? mk2?.mid ?? mk2?.current_mid);
-        if (!Number.isNaN(mid) && isFinite(mid)) return { price: mid, source: "gamma.mid" };
+  if (marketObj?.slug) {
+    const endpoint = `https://gamma-api.polymarket.com/markets/slug/${marketObj.slug}`;
+    const mk2 = await fetchJsonWithTimeout(endpoint, 4_000);
+    if (mk2) {
+      logApiResponse(endpoint, mk2, "MARKET_MID_PRICE_FALLBACK");
+      const mid = Number(mk2?.mid_price ?? mk2?.mid ?? mk2?.current_mid);
+      if (!Number.isNaN(mid) && Number.isFinite(mid)) {
+        return remember(mid, "gamma.mid");
       }
     }
-  } catch {}
+  }
 
-  return { price: null, source: "none_found" };
+  return remember(null, "none_found");
 }
 
 // ----------------- console UI -----------------
@@ -541,11 +764,20 @@ function calculateBtcMetrics(history: BtcPriceSample[], current: number): BtcMet
   // Fast lookup: find price at various time offsets (optimized for speed)
   const find = (msAgo: number) => {
     const targetTs = now - msAgo;
-    // Binary search backwards for speed
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].ts <= targetTs) return history[i].price;
+    let lo = 0;
+    let hi = history.length - 1;
+    let candidate: number | null = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const sample = history[mid];
+      if (sample.ts <= targetTs) {
+        candidate = sample.price;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
     }
-    return null;
+    return candidate;
   };
 
   // SUB-SECOND METRICS (critical for scalping)
@@ -603,33 +835,65 @@ function calculateBtcMetrics(history: BtcPriceSample[], current: number): BtcMet
 }
 
 // ----------------- BTC price polling -----------------
-async function pollCurrentBtcPrice(): Promise<number | null> {
-  // Try Binance → Coinbase → CoinGecko
-  try {
-    const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
-    if (r.ok) {
-      const data = await r.json();
-      const price = Number((data as any)?.price);
-      if (Number.isFinite(price)) return price;
+async function fetchLatestBtcPrice(): Promise<number | null> {
+  const sources: Array<{ url: string; extractor: (data: any) => number | null }> = [
+    {
+      url: "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
+      extractor: (data) => {
+        const value = Number(data?.price);
+        return Number.isFinite(value) ? value : null;
+      },
+    },
+    {
+      url: "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+      extractor: (data) => {
+        const value = Number(data?.data?.amount);
+        return Number.isFinite(value) ? value : null;
+      },
+    },
+    {
+      url: "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
+      extractor: (data) => {
+        const value = Number(data?.bitcoin?.usd);
+        return Number.isFinite(value) ? value : null;
+      },
+    },
+  ];
+
+  for (const source of sources) {
+    const data = await fetchJsonWithTimeout(source.url, 2_500);
+    if (!data) continue;
+    const value = source.extractor(data);
+    if (value != null) {
+      logApiResponse(source.url, data, "BTC_POLL");
+      return value;
     }
-  } catch {}
-  try {
-    const r = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");
-    if (r.ok) {
-      const data = await r.json();
-      const price = Number((data as any)?.data?.amount);
-      if (Number.isFinite(price)) return price;
-    }
-  } catch {}
-  try {
-    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd");
-    if (r.ok) {
-      const data = await r.json();
-      const price = (data as any)?.bitcoin?.usd;
-      if (typeof price === "number" && Number.isFinite(price)) return price;
-    }
-  } catch {}
+  }
   return null;
+}
+
+async function pollCurrentBtcPrice(): Promise<number | null> {
+  const now = Date.now();
+  if (lastBtcPrice !== null && now - lastBtcPriceTs < BTC_PRICE_CACHE_TTL_MS) {
+    return lastBtcPrice;
+  }
+
+  if (!btcPriceRequest) {
+    btcPriceRequest = (async () => {
+      const fresh = await fetchLatestBtcPrice();
+      if (fresh != null) {
+        lastBtcPrice = fresh;
+        lastBtcPriceTs = Date.now();
+        return fresh;
+      }
+      return lastBtcPrice;
+    })().finally(() => {
+      btcPriceRequest = null;
+    });
+  }
+
+  const result = await btcPriceRequest;
+  return result ?? lastBtcPrice;
 }
 
 // Calculate next 15m market slug based on current one
@@ -902,10 +1166,11 @@ async function runMarket(marketUrl: string) {
   const ctx = new RunContext();
 
   // Graceful exit
-  const onSigint = () => {
+  const onSigint = async () => {
     ctx.aborted = true;
     ctx.clearAll();
     renderUI(state);
+    await flushLogWriters();
     process.exit(0);
   };
   process.once("SIGINT", onSigint);
@@ -923,11 +1188,8 @@ async function runMarket(marketUrl: string) {
     pushLog("WS open");
     state.status = "subscribed";
   
-    // Before (wrong field & lowercase type)
-    // ws.send(JSON.stringify({ type: "market", asset_ids: assetIds }));
-  
-    // After (per docs)
-    ws.send(JSON.stringify({ type: "MARKET", assets_ids: assetIds }));
+    // Subscribe to order book updates for the target tokens
+    ws.send(JSON.stringify({ type: "market", asset_ids: assetIds }));
   
     // keepalive
     const ping = setInterval(() => { try { ws.send("PING"); } catch {} }, 10_000);
@@ -950,7 +1212,7 @@ async function runMarket(marketUrl: string) {
         const t = msg.asset_id ?? msg.market ?? "token";
         const bid = Array.isArray(msg.bids) && msg.bids[0] ? { px: Number(msg.bids[0][0]), sz: Number(msg.bids[0][1]) } : undefined;
         const ask = Array.isArray(msg.asks) && msg.asks[0] ? { px: Number(msg.asks[0][0]), sz: Number(msg.asks[0][1]) } : undefined;
-        const outcome = tokenOutcomes[t];
+        const outcome = tokenOutcomes[t] ?? state.topBooks[t]?.outcome;
         state.topBooks[t] = { bid, ask, outcome };
       } else if (msg?.event_type === "price_change") {
         for (const pc of msg.price_changes ?? []) {
@@ -1085,9 +1347,10 @@ async function runMarket(marketUrl: string) {
               const book = state.topBooks[tokenId];
               const fill = topOfBookFill(book?.bid, state.simState.position.size);
               if (fill) {
-                const success = simulateTrade(state.simState, "SELL", state.simState.position.side, fill.px, 0, tokenId, signal.reason, fill.fee);
+                const closingPosition = state.simState.position;
+                const success = simulateTrade(state.simState, "SELL", closingPosition.side, fill.px, 0, tokenId, signal.reason, fill.fee);
                 if (success) {
-                  pushLog(`[SIM] SELL ${state.simState.position.side} @ ${fill.px.toFixed(4)} x${fill.sz.toFixed(1)} (fee ${fill.fee.toFixed(4)})`);
+                  pushLog(`[SIM] SELL ${closingPosition.side} @ ${fill.px.toFixed(4)} x${fill.sz.toFixed(1)} (fee ${fill.fee.toFixed(4)})`);
                   const last = state.simState.trades[state.simState.trades.length - 1];
                   const r = signal.reason || "";
                   const flags = {
@@ -1099,7 +1362,7 @@ async function runMarket(marketUrl: string) {
                   logSim({
                     type: "execution",
                     action: "SELL",
-                    side: state.simState.position.side,
+                    side: closingPosition.side,
                     price: fill.px,
                     size: fill.sz,
                     fee: fill.fee,
