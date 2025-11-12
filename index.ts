@@ -1,4 +1,3 @@
-// @ts-nocheck
 // index.ts (ESM, TypeScript-friendly)
 // npm i ws undici chalk
 import { WebSocket } from "ws";
@@ -37,13 +36,15 @@ let lastBtcPriceTs = 0;
 let btcPriceRequest: Promise<number | null> | null = null;
 
 class AsyncLogWriter {
-  private readonly file: string;
-  private readonly flushIntervalMs: number;
+  private buffer: string[] = [];
+  private flushing = false;
+  private timer?: NodeJS.Timeout;
 
-  constructor(file: string, flushIntervalMs = 250) {
-    this.file = file;
-    this.flushIntervalMs = flushIntervalMs;
-  }
+  constructor(
+    private readonly file: string,
+    private readonly flushIntervalMs = 250,
+    private readonly maxBatchBytes = 16_384,
+  ) {}
 
   write(chunk: string) {
     this.buffer.push(chunk);
@@ -273,7 +274,7 @@ async function tryGammaForTokenIds(slug: string): Promise<{ assetIds: string[]; 
     const endpoint = `https://gamma-api.polymarket.com/markets/slug/${slug}`;
     const r = await fetch(endpoint);
     if (r.ok) {
-      const mk = await r.json();
+      const mk: any = await r.json();
       logApiResponse(endpoint, mk, "MARKET_BY_SLUG - Could contain starting price info");
       const raw = mk?.clobTokenIds ?? mk?.clob_token_ids ?? mk?.tokens?.map((t: any) => t?.token_id ?? t?.tokenId ?? t?.id) ?? mk;
       const ids = normalizeAssetIds(raw);
@@ -329,7 +330,7 @@ async function tryGammaForTokenIds(slug: string): Promise<{ assetIds: string[]; 
     const endpoint2 = `https://gamma-api.polymarket.com/events/slug/${slug}`;
     const r2 = await fetch(endpoint2);
     if (r2.ok) {
-      const ev = await r2.json();
+      const ev: any = await r2.json();
       logApiResponse(endpoint2, ev, "EVENT_BY_SLUG - Could contain starting price info");
       const bag: string[] = [];
       for (const m of ev?.markets ?? []) {
@@ -347,14 +348,14 @@ async function tryGammaForTokenIds(slug: string): Promise<{ assetIds: string[]; 
     const endpoint3 = `https://gamma-api.polymarket.com/search?${qs.toString()}`;
     const r3 = await fetch(endpoint3);
     if (r3.ok) {
-      const res = await r3.json();
+      const res: any = await r3.json();
       logApiResponse(endpoint3, res, "GAMMA_SEARCH - Could contain starting price info");
       const cand = (res?.markets ?? [])[0];
       if (cand?.id) {
         const endpoint4 = `https://gamma-api.polymarket.com/markets/${cand.id}`;
         const r4 = await fetch(endpoint4);
         if (r4.ok) {
-          const mk = await r4.json();
+          const mk: any = await r4.json();
           logApiResponse(endpoint4, mk, "MARKET_BY_ID - Could contain starting price info");
           const raw = mk?.clobTokenIds ?? mk?.clob_token_ids ?? mk?.tokens?.map((t: any) => t?.token_id ?? t?.tokenId ?? t?.id) ?? mk;
           const ids = normalizeAssetIds(raw);
